@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.20)
+project(pizza_order_account C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+function(enable_strict_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+endfunction()
+
+add_library(account STATIC src/account.c)
+target_include_directories(account PUBLIC include)
+enable_strict_warnings(account)
+
+add_executable(account_demo examples/account_demo.c)
+target_link_libraries(account_demo PRIVATE account)
+enable_strict_warnings(account_demo)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_account tests/test_account.c)
+    target_link_libraries(test_account PRIVATE account)
+    enable_strict_warnings(test_account)
+    add_test(NAME account COMMAND test_account)
+endif()
