@@ -1,89 +1,48 @@
 #ifndef PIZZA_ACCOUNT_H
 #define PIZZA_ACCOUNT_H
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
-#define ACCOUNT_USERNAME_CAPACITY 32
-#define ACCOUNT_NAME_CAPACITY 64
-#define ACCOUNT_PHONE_CAPACITY 32
-#define ACCOUNT_PASSWORD_CAPACITY 128
-
-typedef uint64_t AccountId;
-
-typedef enum {
-    ACCOUNT_OK = 0,
-    ACCOUNT_INVALID_ARGUMENT,
-    ACCOUNT_INVALID_USERNAME,
-    ACCOUNT_INVALID_NAME,
-    ACCOUNT_INVALID_PHONE,
-    ACCOUNT_INVALID_PASSWORD,
-    ACCOUNT_DUPLICATE_USERNAME,
-    ACCOUNT_AUTH_FAILED,
-    ACCOUNT_NOT_FOUND,
-    ACCOUNT_ALREADY_INACTIVE,
-    ACCOUNT_OUT_OF_MEMORY,
-    ACCOUNT_ID_EXHAUSTED
-} AccountResult;
+#include "models.h"
+#include "result.h"
 
 typedef struct {
-    AccountId id;
-    char username[ACCOUNT_USERNAME_CAPACITY];
-    char name[ACCOUNT_NAME_CAPACITY];
-    char phone[ACCOUNT_PHONE_CAPACITY];
-    bool active;
-} AccountProfile;
+    CustomerProfile profile;
+    const char *password; /* Borrowed only until the function returns. */
+} CustomerRegistration;
 
-typedef struct AccountRecord AccountRecord;
+/* Public self-registration. Assign a fresh persistent ID, active=true and a
+ * zero balance. A successful mutation is already saved to disk. */
+Result account_register(AppState *state,
+                        const CustomerRegistration *registration,
+                        AccountId *out_account_id);
 
-typedef struct {
-    AccountRecord *records;
-    size_t count;
-    size_t capacity;
-    AccountId next_id;
-    uint64_t next_salt;
-} AccountStore;
+/* Both logins reset a non-NULL out_session to {0} BEFORE any validation.
+ * Unknown IDs/usernames and wrong passwords return AUTH_FAILED; a correctly
+ * authenticated disabled customer returns ACCOUNT_INACTIVE. */
+Result account_login_customer(const AppState *state, AccountId account_id,
+                              const char *password, Session *out_session);
+Result account_login_manager(const AppState *state, const char *username,
+                             const char *password, Session *out_session);
+void account_logout(Session *session); /* NULL is allowed. */
 
-void account_store_init(AccountStore *store);
-void account_store_free(AccountStore *store);
+/* Customer: own ID only. Manager: any customer. Copies public data to out. */
+Result account_get_customer(const AppState *state, const Session *session,
+                            AccountId account_id, Customer *out_customer);
+Result account_update_profile(AppState *state, const Session *session,
+                              AccountId account_id,
+                              const CustomerProfile *profile);
 
-AccountResult account_register(AccountStore *store,
-                               const char *username,
-                               const char *password,
-                               const char *name,
-                               const char *phone,
-                               AccountId *account_id);
+/* Manager-only operations. Disabling is a logical deletion: retain balance,
+ * identity and all historical orders; re-enabling is supported. */
+Result account_add_customer(AppState *state, const Session *manager,
+                            const CustomerRegistration *registration,
+                            AccountId *out_account_id);
+Result account_set_active(AppState *state, const Session *manager,
+                          AccountId account_id, bool active);
 
-AccountResult account_login(const AccountStore *store,
-                            const char *username,
-                            const char *password,
-                            AccountId *account_id);
-
-AccountResult account_get_profile(const AccountStore *store,
-                                  AccountId account_id,
-                                  AccountProfile *profile);
-
-AccountResult account_update_profile(AccountStore *store,
-                                     AccountId account_id,
-                                     const char *name,
-                                     const char *phone);
-
-AccountResult account_manager_add_customer(AccountStore *store,
-                                           const char *username,
-                                           const char *password,
-                                           const char *name,
-                                           const char *phone,
-                                           AccountId *account_id);
-
-AccountResult account_manager_update_customer(AccountStore *store,
-                                              AccountId account_id,
-                                              const char *name,
-                                              const char *phone);
-
-AccountResult account_manager_delete_customer(AccountStore *store,
-                                              AccountId account_id);
-
-const char *account_result_message(AccountResult result);
+/* Manager only, sorted by account ID. For the shared list/buffer contract see
+ * docs/public-api.md. include_inactive=false lists active customers only. */
+Result account_list_customers(const AppState *state, const Session *manager,
+                              bool include_inactive, Customer *out_customers,
+                              size_t capacity, size_t *out_count);
 
 #endif

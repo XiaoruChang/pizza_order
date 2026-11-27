@@ -1,4 +1,5 @@
 /build/
+/build*/
 *.exe
 *.o
 *.obj
@@ -10,3 +11,4 @@
 .vscode/
 .env
 .env.*
+/data/
