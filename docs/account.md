@@ -1,61 +1,47 @@
-# 客户账户模块说明
+# 账户认证与客户资料模块
+
+## 当前边界
+
+`include/account.h` 是仓库 `main` 的公共契约。它把账户操作绑定到不透明的
+`AppState`，因此账户记录、密码验证记录和持久化提交必须由账户模块与公共存储模块共同实现。
+本分支保留的 `src/account.c` 是合并公共契约前的内存原型，接口为 `AccountStore`；它用于说明
+认证算法和测试思路，不能直接替代 `account.h` 中的正式实现。
 
 ## 组件
 
 | 组件 | 作用 |
 | --- | --- |
-| `AccountStore` | 管理客户记录的生命周期和唯一账户编号 |
-| `account_register` | 校验注册资料、生成账户编号并保存凭据摘要 |
-| `account_login` | 校验用户名和密码，返回当前账户编号 |
-| `account_get_profile` / `account_update_profile` | 客户查看和修改姓名、电话 |
-| `account_manager_*` | 经理新增、修改和停用客户账户 |
-| 应用菜单 | 负责读取输入、验证经理身份并调用本模块 |
+| `CustomerRegistration` | 借用注册资料和密码；密码只在调用期间有效 |
+| `account_register` / `account_add_customer` | 创建客户、分配不重复的 `AccountId`，初始化余额为零 |
+| `account_login_customer` / `account_login_manager` | 验证凭据并产生带角色的 `Session` |
+| `account_get_customer` / `account_update_profile` | 按会话权限读取或修改姓名、电话 |
+| `account_set_active` / `account_list_customers` | 经理停用、恢复和列出客户 |
+| `storage_*` | 负责 `AppState` 的生命周期、凭据记录保存和原子提交 |
 
-模块只负责客户账户。订单、余额、菜单和文件持久化由其他模块负责，通过适配器调用本接口。
+## 请求流
 
-## 请求流程
+1. 注册或经理新增时，适配器收集完整输入并构造 `CustomerRegistration`。
+2. `account_register` 校验非空字符串、长度和控制字符，检查用户名唯一性，分配单调递增的账户编号。
+3. 登录前先把非空 `out_session` 清零；客户登录提交账户号和密码，经理登录提交用户名和密码。
+4. 账户模块从私有凭据记录读取盐值和验证摘要，重新计算摘要并比较。成功只写入 `Session.account_id` 与 `Session.role`；调用者不能自行伪造角色。
+5. 客户资料接口再次检查会话角色、账户归属和账户是否启用，然后返回独立的 `Customer` 副本。
+6. 成功的注册、资料修改、停用或恢复必须在返回前通过存储层原子保存；失败时内存和文件都保持原值。
+7. 注销调用 `account_logout` 清零会话。状态关闭后，原会话立即失效。
 
-### 注册
+## 凭据与令牌
 
-1. 菜单读取用户名、密码、姓名和电话。
-2. `account_register` 校验长度、控制字符、用户名字符集和电话字符集。
-3. 模块拒绝重复用户名，分配单调递增的 `AccountId`。
-4. 模块保存用户名、姓名、电话、盐值和密码摘要，并只把账户编号返回给调用者。
+- 公共 `Customer` 结构不包含密码、盐值或验证摘要；这些字段只能存在于 `AppState` 的私有凭据记录中。
+- 密码长度按 `PIZZA_PASSWORD_MIN_BYTES` 至 `PIZZA_PASSWORD_MAX_BYTES` 校验，保留用户输入的空格，不写日志、不写销售快照，也不提交到 Git。
+- `RESULT_AUTH_FAILED` 对错误密码、未知账户和错误经理用户名统一返回；已正确认证但已停用的客户返回 `RESULT_ACCOUNT_INACTIVE`。
+- 当前程序是本地 C 控制台，没有 HTTP 边界，因此没有 JWT、Cookie 或 Bearer token。`Session` 是绑定到单个 `AppState` 生命周期的进程内身份，不是可跨网络传输的访问令牌。
+- 若未来增加网络服务，服务层应在登录成功后签发短期随机令牌，只保存令牌摘要和过期时间，并通过 TLS 传输；注销、过期或账户停用后拒绝该令牌。
 
-### 登录
+## 代码核对
 
-1. 菜单读取用户名和密码。
-2. `account_login` 查找活动账户并用记录中的盐值重新计算密码摘要。
-3. 摘要匹配时返回 `AccountId`，应用层把它放入当前会话。
-4. 摘要不匹配、账户不存在或账户已停用时统一返回 `ACCOUNT_AUTH_FAILED`。
-5. 注销时应用层必须清除会话中的账户编号，避免复用上一个客户身份。
+旧原型 `src/account.c` 的 `password_digest` 使用“盐值 + 摘要”而不是明文密码，`account_login` 在失败时把输出账户号清零；
+`account_manager_delete_customer` 采用停用而非物理删除，保留编号以便订单历史继续引用。这些行为与
+`docs/public-api.md` 的安全意图一致，但原型仍未接入正式 `AppState` 和持久化事务。
 
-### 客户资料
+## 集成阻塞
 
-应用层使用登录得到的 `AccountId` 调用 `account_get_profile` 或
-`account_update_profile`。模块再次检查账户是否存在且处于活动状态，不能仅相信菜单传入的编号。
-
-### 经理客户管理
-
-经理菜单先完成自己的身份验证，再调用 `account_manager_add_customer`、
-`account_manager_update_customer` 或 `account_manager_delete_customer`。本模块不把任何默认经理
-密码写死，也不自行授予经理权限。删除采用停用语义，保留账户编号以便订单历史继续引用。
-
-## 凭据和令牌处理
-
-- `AccountRecord` 不保存明文密码，只保存带盐的摘要。当前摘要是无外部依赖的课程实现，
-  生产服务应替换为 Argon2id、scrypt 或平台提供的密码 KDF。
-- 登录接口返回账户编号，不返回密码、盐值或内部摘要。
-- 当前项目是本地 C 程序，没有 HTTP 请求边界，因此没有 JWT、Cookie 或 Bearer token。
-  `AccountId` 只是进程内会话标识，不能直接当作跨网络访问令牌。
-- 如果后续增加网络服务，应由服务层在登录成功后签发短期、随机、可撤销的会话令牌，
-  令牌只存摘要和过期时间，客户端通过 TLS 传输，并在注销或过期后拒绝使用。
-- 密码和令牌不应写入日志、提交到 Git 或放入配置文件。测试只使用固定演示密码，不能用于正式部署。
-
-## 公共接口约定
-
-- 返回 `ACCOUNT_OK` 表示成功，其他值表示失败，调用者应使用 `account_result_message` 显示原因。
-- `AccountStore` 由创建者初始化并最终调用 `account_store_free`，释放后不能继续使用其记录指针。
-- `AccountProfile` 不包含密码摘要和盐值，适合交给菜单或报告层显示。
-- 当前存储是内存存储，进程结束后账户丢失。接入持久化时需保证唯一用户名和账户编号约束，
-  并在加载失败时向上层返回错误，不能伪装为空账户表。
+`origin/main` 尚未提供 `AppState` 的私有布局、凭据存储和原子提交辅助接口。账户实现若自行定义布局会与负责公共存储的成员冲突，因此正式账户业务暂以 Draft PR 交付，待小组统一内部接口后再接入并补充端到端持久化测试。
