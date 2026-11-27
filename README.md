@@ -54,4 +54,6 @@ Linux/macOS 或 MSVC 可省略生成器参数，并使用相应工具链。
 
 ## 账户模块状态
 
-账户公共接口已经按 `include/account.h` 和 `docs/public-api.md` 统一；实际账户实现需要与负责公共存储的成员共同确定 `AppState` 内部凭据记录、原子提交和加载校验接口，完成后再接入持久化账户服务。
+账户业务逻辑已经按 `include/account.h` 和 `docs/public-api.md` 实现，使用
+`src/account_private.h` 与存储层协作。当前仓库还没有 `AppState`/`storage_*` 的正式实现，
+因此测试使用独立后端验证账户行为；存储成员接入时需要实现同一私有接口并补充关闭后重开的持久化测试。

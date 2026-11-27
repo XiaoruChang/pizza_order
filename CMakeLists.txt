@@ -14,16 +14,13 @@ function(enable_strict_warnings target)
 endfunction()
 
 add_library(account STATIC src/account.c)
-target_include_directories(account PUBLIC include)
+target_include_directories(account PUBLIC include PRIVATE src)
 enable_strict_warnings(account)
-
-add_executable(account_demo examples/account_demo.c)
-target_link_libraries(account_demo PRIVATE account)
-enable_strict_warnings(account_demo)
 
 include(CTest)
 if(BUILD_TESTING)
     add_executable(test_account tests/test_account.c)
+    target_include_directories(test_account PRIVATE src)
     target_link_libraries(test_account PRIVATE account)
     enable_strict_warnings(test_account)
     add_test(NAME account COMMAND test_account)

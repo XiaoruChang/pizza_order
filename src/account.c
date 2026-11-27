@@ -1,28 +1,20 @@
 #include "account.h"
 
+#include "account_private.h"
+
 #include <ctype.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
-struct AccountRecord {
-    AccountId id;
-    char username[ACCOUNT_USERNAME_CAPACITY];
-    char name[ACCOUNT_NAME_CAPACITY];
-    char phone[ACCOUNT_PHONE_CAPACITY];
-    uint64_t salt;
-    uint64_t password_hash;
-    bool active;
-};
-
-static size_t text_length(const char *text, size_t capacity)
+static size_t bounded_length(const char *text, size_t limit)
 {
     size_t length = 0;
 
     if (text == NULL) {
-        return capacity;
+        return limit + 1;
     }
-    while (length < capacity && text[length] != '\0') {
+    while (length <= limit && text[length] != '\0') {
         ++length;
     }
     return length;
@@ -30,8 +22,8 @@ static size_t text_length(const char *text, size_t capacity)
 
 static bool valid_text(const char *text, size_t capacity)
 {
+    size_t length = bounded_length(text, capacity - 1);
     size_t i;
-    size_t length = text_length(text, capacity);
 
     if (length == 0 || length >= capacity) {
         return false;
@@ -44,352 +36,534 @@ static bool valid_text(const char *text, size_t capacity)
     return true;
 }
 
-static bool valid_username(const char *username)
-{
-    size_t i;
-
-    if (!valid_text(username, ACCOUNT_USERNAME_CAPACITY)) {
-        return false;
-    }
-    for (i = 0; username[i] != '\0'; ++i) {
-        if (isalnum((unsigned char)username[i]) == 0 && username[i] != '_' &&
-            username[i] != '-' && username[i] != '.') {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool valid_phone(const char *phone)
-{
-    size_t i;
-
-    if (!valid_text(phone, ACCOUNT_PHONE_CAPACITY)) {
-        return false;
-    }
-    for (i = 0; phone[i] != '\0'; ++i) {
-        if (isdigit((unsigned char)phone[i]) == 0 && phone[i] != '+' &&
-            phone[i] != '-' && phone[i] != '(' && phone[i] != ')' &&
-            phone[i] != ' ') {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool valid_password(const char *password)
 {
-    return valid_text(password, ACCOUNT_PASSWORD_CAPACITY);
+    size_t length = bounded_length(password, PIZZA_PASSWORD_MAX_BYTES);
+    size_t i;
+
+    if (length < PIZZA_PASSWORD_MIN_BYTES ||
+        length > PIZZA_PASSWORD_MAX_BYTES) {
+        return false;
+    }
+    for (i = 0; i < length; ++i) {
+        if (iscntrl((unsigned char)password[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
-static void copy_text(char *destination, const char *source)
+static bool valid_login(const char *username)
 {
-    size_t length = strlen(source);
-    memcpy(destination, source, length + 1);
+    return valid_text(username, PIZZA_LOGIN_CAPACITY);
 }
 
-/* A compact salted digest keeps plaintext passwords out of AccountRecord.
- * A deployed service should replace this educational digest with Argon2id,
- * scrypt, or another password-specific KDF supplied by its platform. */
-static uint64_t password_digest(const char *password, uint64_t salt)
+static bool constant_time_equal(uint64_t left, uint64_t right)
+{
+    uint64_t difference = left ^ right;
+
+    difference |= difference >> 32;
+    difference |= difference >> 16;
+    difference |= difference >> 8;
+    return (difference & UINT64_C(0xff)) == 0;
+}
+
+uint64_t account_password_digest(const char *password, uint64_t salt)
 {
     uint64_t hash = UINT64_C(1469598103934665603) ^ salt;
     size_t i;
+    unsigned int round;
 
-    for (i = 0; password[i] != '\0'; ++i) {
-        hash ^= (unsigned char)password[i];
-        hash *= UINT64_C(1099511628211);
-        hash ^= hash >> 29;
+    for (round = 0; round < 4; ++round) {
+        for (i = 0; password[i] != '\0'; ++i) {
+            hash ^= (unsigned char)password[i];
+            hash *= UINT64_C(1099511628211);
+            hash ^= hash >> 29;
+        }
+        hash ^= hash >> 33;
+        hash *= UINT64_C(0xff51afd7ed558ccd);
+        hash ^= hash >> 33;
+        hash += UINT64_C(0x9e3779b97f4a7c15) + round;
     }
-    hash ^= hash >> 33;
-    hash *= UINT64_C(0xff51afd7ed558ccd);
-    hash ^= hash >> 33;
     return hash;
 }
 
-static AccountRecord *find_record(AccountStore *store, AccountId id)
+static AccountRecord *find_customer(AccountStore *store, AccountId account_id)
 {
     size_t i;
 
-    for (i = 0; i < store->count; ++i) {
-        if (store->records[i].id == id) {
-            return &store->records[i];
+    for (i = 0; i < store->customer_count; ++i) {
+        if (store->customers[i].account_id == account_id) {
+            return &store->customers[i];
         }
     }
     return NULL;
 }
 
-static const AccountRecord *find_record_const(const AccountStore *store,
-                                              AccountId id)
+static const AccountRecord *find_customer_const(const AccountStore *store,
+                                                AccountId account_id)
 {
     size_t i;
 
-    for (i = 0; i < store->count; ++i) {
-        if (store->records[i].id == id) {
-            return &store->records[i];
+    for (i = 0; i < store->customer_count; ++i) {
+        if (store->customers[i].account_id == account_id) {
+            return &store->customers[i];
         }
     }
     return NULL;
 }
 
-static const AccountRecord *find_username(const AccountStore *store,
-                                          const char *username)
-{
-    size_t i;
-
-    for (i = 0; i < store->count; ++i) {
-        if (strcmp(store->records[i].username, username) == 0) {
-            return &store->records[i];
-        }
-    }
-    return NULL;
-}
-
-static AccountResult reserve_record(AccountStore *store)
+static Result reserve_customer(AccountStore *store)
 {
     size_t new_capacity;
-    AccountRecord *records;
+    AccountRecord *customers;
 
-    if (store->count < store->capacity) {
-        return ACCOUNT_OK;
+    if (store->customer_count < store->customer_capacity) {
+        return RESULT_OK;
     }
-    if (store->capacity == 0) {
+    if (store->customer_capacity == 0) {
         new_capacity = 8;
     } else {
-        if (store->capacity > SIZE_MAX / 2) {
-            return ACCOUNT_OUT_OF_MEMORY;
+        if (store->customer_capacity > SIZE_MAX / 2) {
+            return RESULT_NO_MEMORY;
         }
-        new_capacity = store->capacity * 2;
+        new_capacity = store->customer_capacity * 2;
     }
-    records = realloc(store->records, new_capacity * sizeof(*records));
-    if (records == NULL) {
-        return ACCOUNT_OUT_OF_MEMORY;
+    if (new_capacity > SIZE_MAX / sizeof(*customers)) {
+        return RESULT_NO_MEMORY;
     }
-    store->records = records;
-    store->capacity = new_capacity;
-    return ACCOUNT_OK;
+    customers = realloc(store->customers, new_capacity * sizeof(*customers));
+    if (customers == NULL) {
+        return RESULT_NO_MEMORY;
+    }
+    store->customers = customers;
+    store->customer_capacity = new_capacity;
+    return RESULT_OK;
 }
 
-void account_store_init(AccountStore *store)
+static Result read_store(const AppState *state, const AccountStore **out_store)
 {
-    if (store == NULL) {
-        return;
+    Result result;
+
+    if (state == NULL || out_store == NULL) {
+        return RESULT_INVALID_ARGUMENT;
     }
-    store->records = NULL;
-    store->count = 0;
-    store->capacity = 0;
-    store->next_id = UINT64_C(1000001);
-    store->next_salt = UINT64_C(0x9e3779b97f4a7c15);
+    result = account_backend_read(state, out_store);
+    if (result == RESULT_OK && *out_store == NULL) {
+        return RESULT_INVALID_DATA;
+    }
+    return result;
 }
 
-void account_store_free(AccountStore *store)
+static Result clone_store(const AppState *state, AccountStore *out_store)
 {
+    Result result;
+
+    if (state == NULL || out_store == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    memset(out_store, 0, sizeof(*out_store));
+    result = account_backend_clone(state, out_store);
+    if (result != RESULT_OK) {
+        account_backend_dispose(out_store);
+    }
+    return result;
+}
+
+static Result require_manager(const Session *session)
+{
+    if (session == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (session->role != SESSION_MANAGER || session->account_id != 0) {
+        return RESULT_PERMISSION_DENIED;
+    }
+    return RESULT_OK;
+}
+
+static Result require_customer_owner(const Session *session,
+                                     AccountId account_id)
+{
+    if (session == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (session->role != SESSION_CUSTOMER || session->account_id == 0) {
+        return RESULT_PERMISSION_DENIED;
+    }
+    return session->account_id == account_id ? RESULT_OK
+                                              : RESULT_PERMISSION_DENIED;
+}
+
+static Result validate_registration(const CustomerRegistration *registration)
+{
+    if (registration == NULL || registration->password == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (!valid_text(registration->profile.name, PIZZA_NAME_CAPACITY) ||
+        !valid_text(registration->profile.telephone,
+                    PIZZA_PHONE_CAPACITY) ||
+        !valid_password(registration->password)) {
+        return RESULT_INVALID_INPUT;
+    }
+    return RESULT_OK;
+}
+
+static Result add_customer_to_store(AccountStore *store,
+                                    const CustomerRegistration *registration,
+                                    AccountId *out_account_id)
+{
+    AccountRecord *customer;
+    Result result;
+
+    if (store->next_account_id == 0 ||
+        store->next_account_id == UINT64_MAX || store->next_salt == 0 ||
+        store->next_salt == UINT64_MAX) {
+        return RESULT_OVERFLOW;
+    }
+    result = reserve_customer(store);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    customer = &store->customers[store->customer_count];
+    memset(customer, 0, sizeof(*customer));
+    customer->account_id = store->next_account_id++;
+    customer->profile = registration->profile;
+    customer->balance_cents = 0;
+    customer->password_salt = store->next_salt++;
+    customer->password_digest =
+        account_password_digest(registration->password, customer->password_salt);
+    customer->active = true;
+    ++store->customer_count;
+    *out_account_id = customer->account_id;
+    return RESULT_OK;
+}
+
+Result account_register(AppState *state,
+                        const CustomerRegistration *registration,
+                        AccountId *out_account_id)
+{
+    AccountStore candidate;
+    AccountId account_id;
+    Result result;
+
+    if (state == NULL || registration == NULL || out_account_id == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    result = validate_registration(registration);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = clone_store(state, &candidate);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = add_customer_to_store(&candidate, registration, &account_id);
+    if (result == RESULT_OK) {
+        result = account_backend_commit(state, &candidate);
+    }
+    if (result != RESULT_OK) {
+        account_backend_dispose(&candidate);
+    } else {
+        *out_account_id = account_id;
+    }
+    return result;
+}
+
+Result account_login_customer(const AppState *state, AccountId account_id,
+                              const char *password, Session *out_session)
+{
+    const AccountStore *store;
+    const AccountRecord *customer;
+    Result result;
+
+    if (out_session != NULL) {
+        memset(out_session, 0, sizeof(*out_session));
+    }
+    if (out_session == NULL || state == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (password == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (account_id == 0 || !valid_password(password)) {
+        return RESULT_INVALID_INPUT;
+    }
+    result = read_store(state, &store);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    customer = find_customer_const(store, account_id);
+    if (customer == NULL ||
+        !constant_time_equal(customer->password_digest,
+                             account_password_digest(password,
+                                                    customer->password_salt))) {
+        return RESULT_AUTH_FAILED;
+    }
+    if (!customer->active) {
+        return RESULT_ACCOUNT_INACTIVE;
+    }
+    out_session->account_id = customer->account_id;
+    out_session->role = SESSION_CUSTOMER;
+    return RESULT_OK;
+}
+
+Result account_login_manager(const AppState *state, const char *username,
+                             const char *password, Session *out_session)
+{
+    const AccountStore *store;
+    Result result;
+
+    if (out_session != NULL) {
+        memset(out_session, 0, sizeof(*out_session));
+    }
+    if (out_session == NULL || state == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (username == NULL || password == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (!valid_login(username) || !valid_password(password)) {
+        return RESULT_INVALID_INPUT;
+    }
+    result = read_store(state, &store);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    if (!store->manager_configured ||
+        strcmp(store->manager_username, username) != 0 ||
+        !constant_time_equal(store->manager_digest,
+                             account_password_digest(password,
+                                                    store->manager_salt))) {
+        return RESULT_AUTH_FAILED;
+    }
+    out_session->account_id = 0;
+    out_session->role = SESSION_MANAGER;
+    return RESULT_OK;
+}
+
+void account_logout(Session *session)
+{
+    if (session != NULL) {
+        memset(session, 0, sizeof(*session));
+    }
+}
+
+static void copy_customer(Customer *out_customer,
+                          const AccountRecord *customer)
+{
+    out_customer->account_id = customer->account_id;
+    out_customer->profile = customer->profile;
+    out_customer->balance_cents = customer->balance_cents;
+    out_customer->active = customer->active;
+}
+
+Result account_get_customer(const AppState *state, const Session *session,
+                            AccountId account_id, Customer *out_customer)
+{
+    const AccountStore *store;
+    const AccountRecord *customer;
+    Result result;
+
+    if (state == NULL || session == NULL || out_customer == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (account_id == 0) {
+        return RESULT_INVALID_INPUT;
+    }
+    if (session->role == SESSION_CUSTOMER) {
+        result = require_customer_owner(session, account_id);
+        if (result != RESULT_OK) {
+            return result;
+        }
+    } else {
+        result = require_manager(session);
+        if (result != RESULT_OK) {
+            return result;
+        }
+    }
+    result = read_store(state, &store);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    customer = find_customer_const(store, account_id);
+    if (customer == NULL) {
+        return RESULT_NOT_FOUND;
+    }
+    if (session->role == SESSION_CUSTOMER && !customer->active) {
+        return RESULT_ACCOUNT_INACTIVE;
+    }
+    copy_customer(out_customer, customer);
+    return RESULT_OK;
+}
+
+Result account_update_profile(AppState *state, const Session *session,
+                              AccountId account_id,
+                              const CustomerProfile *profile)
+{
+    AccountStore candidate;
+    AccountRecord *customer;
+    Result result;
+
+    if (state == NULL || session == NULL || profile == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (account_id == 0) {
+        return RESULT_INVALID_INPUT;
+    }
+    if (!valid_text(profile->name, PIZZA_NAME_CAPACITY) ||
+        !valid_text(profile->telephone, PIZZA_PHONE_CAPACITY)) {
+        return RESULT_INVALID_INPUT;
+    }
+    if (session->role == SESSION_CUSTOMER) {
+        result = require_customer_owner(session, account_id);
+    } else {
+        result = require_manager(session);
+    }
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = clone_store(state, &candidate);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    customer = find_customer(&candidate, account_id);
+    if (customer == NULL) {
+        result = RESULT_NOT_FOUND;
+    } else if (session->role == SESSION_CUSTOMER && !customer->active) {
+        result = RESULT_ACCOUNT_INACTIVE;
+    } else {
+        customer->profile = *profile;
+        result = account_backend_commit(state, &candidate);
+    }
+    if (result != RESULT_OK) {
+        account_backend_dispose(&candidate);
+    }
+    return result;
+}
+
+Result account_add_customer(AppState *state, const Session *manager,
+                            const CustomerRegistration *registration,
+                            AccountId *out_account_id)
+{
+    AccountStore candidate;
+    AccountId account_id;
+    Result result;
+
+    if (state == NULL || manager == NULL || registration == NULL ||
+        out_account_id == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    result = require_manager(manager);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = validate_registration(registration);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = clone_store(state, &candidate);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = add_customer_to_store(&candidate, registration, &account_id);
+    if (result == RESULT_OK) {
+        result = account_backend_commit(state, &candidate);
+    }
+    if (result != RESULT_OK) {
+        account_backend_dispose(&candidate);
+    } else {
+        *out_account_id = account_id;
+    }
+    return result;
+}
+
+Result account_set_active(AppState *state, const Session *manager,
+                          AccountId account_id, bool active)
+{
+    AccountStore candidate;
+    AccountRecord *customer;
+    Result result;
+
+    if (state == NULL || manager == NULL) {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    if (account_id == 0) {
+        return RESULT_INVALID_INPUT;
+    }
+    result = require_manager(manager);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    result = clone_store(state, &candidate);
+    if (result != RESULT_OK) {
+        return result;
+    }
+    customer = find_customer(&candidate, account_id);
+    if (customer == NULL) {
+        result = RESULT_NOT_FOUND;
+    } else {
+        customer->active = active;
+        result = account_backend_commit(state, &candidate);
+    }
+    if (result != RESULT_OK) {
+        account_backend_dispose(&candidate);
+    }
+    return result;
+}
+
+Result account_list_customers(const AppState *state, const Session *manager,
+                              bool include_inactive, Customer *out_customers,
+                              size_t capacity, size_t *out_count)
+{
+    const AccountStore *store;
+    size_t required = 0;
     size_t i;
+    size_t written = 0;
+    Result result;
 
-    if (store == NULL) {
-        return;
+    if (state == NULL || manager == NULL || out_count == NULL) {
+        return RESULT_INVALID_ARGUMENT;
     }
-    for (i = 0; i < store->count; ++i) {
-        memset(&store->records[i], 0, sizeof(store->records[i]));
-    }
-    free(store->records);
-    account_store_init(store);
-}
-
-static AccountResult validate_registration(const char *username,
-                                           const char *password,
-                                           const char *name,
-                                           const char *phone)
-{
-    if (!valid_username(username)) {
-        return ACCOUNT_INVALID_USERNAME;
-    }
-    if (!valid_password(password)) {
-        return ACCOUNT_INVALID_PASSWORD;
-    }
-    if (!valid_text(name, ACCOUNT_NAME_CAPACITY)) {
-        return ACCOUNT_INVALID_NAME;
-    }
-    if (!valid_phone(phone)) {
-        return ACCOUNT_INVALID_PHONE;
-    }
-    return ACCOUNT_OK;
-}
-
-AccountResult account_register(AccountStore *store,
-                               const char *username,
-                               const char *password,
-                               const char *name,
-                               const char *phone,
-                               AccountId *account_id)
-{
-    AccountRecord *record;
-    AccountResult result;
-
-    if (store == NULL || account_id == NULL) {
-        return ACCOUNT_INVALID_ARGUMENT;
-    }
-    result = validate_registration(username, password, name, phone);
-    if (result != ACCOUNT_OK) {
+    result = require_manager(manager);
+    if (result != RESULT_OK) {
         return result;
     }
-    if (find_username(store, username) != NULL) {
-        return ACCOUNT_DUPLICATE_USERNAME;
+    if (out_customers == NULL && capacity != 0) {
+        return RESULT_INVALID_ARGUMENT;
     }
-    if (store->next_id == 0 || store->next_salt == 0) {
-        return ACCOUNT_ID_EXHAUSTED;
-    }
-    result = reserve_record(store);
-    if (result != ACCOUNT_OK) {
+    result = read_store(state, &store);
+    if (result != RESULT_OK) {
         return result;
     }
-    record = &store->records[store->count];
-    record->id = store->next_id++;
-    record->salt = store->next_salt++;
-    record->password_hash = password_digest(password, record->salt);
-    copy_text(record->username, username);
-    copy_text(record->name, name);
-    copy_text(record->phone, phone);
-    record->active = true;
-    ++store->count;
-    *account_id = record->id;
-    return ACCOUNT_OK;
-}
+    for (i = 0; i < store->customer_count; ++i) {
+        if (include_inactive || store->customers[i].active) {
+            ++required;
+        }
+    }
+    if (out_customers == NULL) {
+        *out_count = required;
+        return RESULT_OK;
+    }
+    if (capacity < required) {
+        *out_count = required;
+        return RESULT_BUFFER_TOO_SMALL;
+    }
+    for (i = 0; i < store->customer_count; ++i) {
+        size_t position;
 
-AccountResult account_login(const AccountStore *store,
-                            const char *username,
-                            const char *password,
-                            AccountId *account_id)
-{
-    const AccountRecord *record;
-
-    if (store == NULL || account_id == NULL || !valid_username(username) ||
-        !valid_password(password)) {
-        return ACCOUNT_INVALID_ARGUMENT;
+        if (!include_inactive && !store->customers[i].active) {
+            continue;
+        }
+        position = written;
+        while (position > 0 &&
+               out_customers[position - 1].account_id >
+                   store->customers[i].account_id) {
+            out_customers[position] = out_customers[position - 1];
+            --position;
+        }
+        copy_customer(&out_customers[position], &store->customers[i]);
+        ++written;
     }
-    record = find_username(store, username);
-    if (record == NULL || !record->active ||
-        record->password_hash != password_digest(password, record->salt)) {
-        *account_id = 0;
-        return ACCOUNT_AUTH_FAILED;
-    }
-    *account_id = record->id;
-    return ACCOUNT_OK;
-}
-
-AccountResult account_get_profile(const AccountStore *store,
-                                  AccountId account_id,
-                                  AccountProfile *profile)
-{
-    const AccountRecord *record;
-
-    if (store == NULL || profile == NULL || account_id == 0) {
-        return ACCOUNT_INVALID_ARGUMENT;
-    }
-    record = find_record_const(store, account_id);
-    if (record == NULL || !record->active) {
-        return ACCOUNT_NOT_FOUND;
-    }
-    profile->id = record->id;
-    copy_text(profile->username, record->username);
-    copy_text(profile->name, record->name);
-    copy_text(profile->phone, record->phone);
-    profile->active = record->active;
-    return ACCOUNT_OK;
-}
-
-AccountResult account_update_profile(AccountStore *store,
-                                     AccountId account_id,
-                                     const char *name,
-                                     const char *phone)
-{
-    AccountRecord *record;
-
-    if (store == NULL || account_id == 0) {
-        return ACCOUNT_INVALID_ARGUMENT;
-    }
-    if (!valid_text(name, ACCOUNT_NAME_CAPACITY)) {
-        return ACCOUNT_INVALID_NAME;
-    }
-    if (!valid_phone(phone)) {
-        return ACCOUNT_INVALID_PHONE;
-    }
-    record = find_record(store, account_id);
-    if (record == NULL || !record->active) {
-        return ACCOUNT_NOT_FOUND;
-    }
-    copy_text(record->name, name);
-    copy_text(record->phone, phone);
-    return ACCOUNT_OK;
-}
-
-AccountResult account_manager_add_customer(AccountStore *store,
-                                           const char *username,
-                                           const char *password,
-                                           const char *name,
-                                           const char *phone,
-                                           AccountId *account_id)
-{
-    return account_register(store, username, password, name, phone, account_id);
-}
-
-AccountResult account_manager_update_customer(AccountStore *store,
-                                              AccountId account_id,
-                                              const char *name,
-                                              const char *phone)
-{
-    return account_update_profile(store, account_id, name, phone);
-}
-
-AccountResult account_manager_delete_customer(AccountStore *store,
-                                              AccountId account_id)
-{
-    AccountRecord *record;
-
-    if (store == NULL || account_id == 0) {
-        return ACCOUNT_INVALID_ARGUMENT;
-    }
-    record = find_record(store, account_id);
-    if (record == NULL) {
-        return ACCOUNT_NOT_FOUND;
-    }
-    if (!record->active) {
-        return ACCOUNT_ALREADY_INACTIVE;
-    }
-    record->active = false;
-    record->password_hash = 0;
-    record->salt = 0;
-    return ACCOUNT_OK;
-}
-
-const char *account_result_message(AccountResult result)
-{
-    switch (result) {
-    case ACCOUNT_OK:
-        return "Operation completed";
-    case ACCOUNT_INVALID_ARGUMENT:
-        return "Invalid argument";
-    case ACCOUNT_INVALID_USERNAME:
-        return "Username must use letters, digits, '.', '-' or '_'";
-    case ACCOUNT_INVALID_NAME:
-        return "Name is empty, too long, or contains a control character";
-    case ACCOUNT_INVALID_PHONE:
-        return "Phone contains unsupported characters";
-    case ACCOUNT_INVALID_PASSWORD:
-        return "Password is empty, too long, or contains a control character";
-    case ACCOUNT_DUPLICATE_USERNAME:
-        return "Username already exists";
-    case ACCOUNT_AUTH_FAILED:
-        return "Username or password is incorrect";
-    case ACCOUNT_NOT_FOUND:
-        return "Customer account was not found";
-    case ACCOUNT_ALREADY_INACTIVE:
-        return "Customer account is already inactive";
-    case ACCOUNT_OUT_OF_MEMORY:
-        return "Unable to allocate account storage";
-    case ACCOUNT_ID_EXHAUSTED:
-        return "No more account identifiers are available";
-    default:
-        return "Unknown account error";
-    }
+    *out_count = written;
+    return RESULT_OK;
 }
